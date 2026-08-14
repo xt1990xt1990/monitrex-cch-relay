@@ -17,7 +17,7 @@ const configured = await fetch(`${relay}/v1/admin/config`, { method: "POST", bod
 assert.equal(configured.status, 200);
 
 const unauthorized = await fetch(`${relay}/v1/aggregate`, {
-  headers: { authorization: "Bearer WRONG_TOKEN_123456789" },
+  headers: { authorization: "Bearer invalid" },
 });
 assert.equal(unauthorized.status, 401);
 
