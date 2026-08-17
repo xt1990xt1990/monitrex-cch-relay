@@ -501,10 +501,10 @@ export default {
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/setup")) {
         return setupPage(Boolean(await config(env)));
       }
-      if (request.method === "GET" && url.pathname === "/v1/aggregate") return aggregate(request, env);
-      if (request.method === "GET" && url.pathname === "/v1/admin/state") return adminState(request, env);
-      if (request.method === "POST" && url.pathname === "/v1/admin/config") return saveConfig(request, env);
-      if (request.method === "POST" && url.pathname === "/v1/admin/clear") return clearConfig(request, env);
+      if (request.method === "GET" && url.pathname === "/v1/aggregate") return await aggregate(request, env);
+      if (request.method === "GET" && url.pathname === "/v1/admin/state") return await adminState(request, env);
+      if (request.method === "POST" && url.pathname === "/v1/admin/config") return await saveConfig(request, env);
+      if (request.method === "POST" && url.pathname === "/v1/admin/clear") return await clearConfig(request, env);
       return json({ error: "not found" }, 404);
     } catch (error) {
       return json({ error: safeError(error) }, 400);
