@@ -39,12 +39,32 @@ const server = http.createServer((request, response) => {
     return;
   }
   if (url.pathname === "/api/leaderboard" && url.searchParams.get("scope") === "provider") {
+    if (url.searchParams.get("includeModelStats") !== "true") {
+      response.writeHead(400).end(JSON.stringify({ error: "model stats required" }));
+      return;
+    }
     response.end(JSON.stringify({ items: [{
       providerId: 17,
       totalRequests: 10,
       successRate: 0.9,
       avgTtftMs: 125,
       avgTokensPerSecond: 42,
+      modelStats: [
+        {
+          model: "gpt-5.6-sol",
+          totalRequests: 6,
+          successRate: 1,
+          avgTtftMs: 100,
+          avgTokensPerSecond: 50,
+        },
+        {
+          model: "gpt-5.6-terra",
+          totalRequests: 4,
+          successRate: 0.75,
+          avgTtftMs: 200,
+          avgTokensPerSecond: 30,
+        },
+      ],
     }] }));
     return;
   }
@@ -54,6 +74,20 @@ const server = http.createServer((request, response) => {
       totalRequests: 5,
       totalInputTokens: 1000,
       cacheReadTokens: 400,
+      modelStats: [
+        {
+          model: "gpt-5.6-sol",
+          totalRequests: 3,
+          totalInputTokens: 600,
+          cacheReadTokens: 360,
+        },
+        {
+          model: "gpt-5.6-terra",
+          totalRequests: 2,
+          totalInputTokens: 400,
+          cacheReadTokens: 40,
+        },
+      ],
     }] }));
     return;
   }

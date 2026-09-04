@@ -19,11 +19,19 @@ The relay returns only:
 - a random relay instance ID and collection time;
 - CCH provider numeric ID and protocol type;
 - provider API endpoint host, port, and path;
-- hourly availability plus daily request, success, TTFB, TPS, and cache aggregates.
+- hourly provider-level availability;
+- daily request, success, TTFB, TPS, and cache aggregates split by model.
 
 It has no response fields for the CCH URL, CCH origin address, CCH API key, provider display name, upstream key, masked key, group tag, account, request body, response body, or individual usage logs.
 
 If a provider endpoint itself is an IP address, that endpoint IP is included so MoniTrex can match the provider. It is not the CCH origin address.
+
+## Upgrade
+
+Version 0.2 adds model-level daily aggregates. Existing deployments can upgrade in place: keep the
+same Worker name and D1 binding, update the source, and deploy again. The encrypted CCH settings,
+tokens, and stable instance ID remain in the existing D1 database; no setup form needs to be
+submitted again.
 
 ## Removal
 

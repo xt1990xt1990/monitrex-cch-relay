@@ -40,12 +40,38 @@ assert.deepEqual(Object.keys(aggregate.providers[0]).sort(), [
   "endpoint_host",
   "endpoint_path",
   "metrics",
+  "model_metrics",
   "provider_type",
   "website_host",
 ]);
+assert.equal(aggregate.schema_version, 2);
+assert.equal(aggregate.protocol_version, 2);
+assert.equal(aggregate.privacy_version, 2);
 assert.equal(aggregate.providers[0].endpoint_host, "api.example.com");
 assert.equal(aggregate.providers[0].website_host, null);
 assert.equal(aggregate.providers[0].metrics.avg_ttfb_ms, 125);
+assert.deepEqual(aggregate.providers[0].model_metrics, [
+  {
+    model_name: "gpt-5.6-sol",
+    request_count: 6,
+    success_rate: 1,
+    avg_ttfb_ms: 100,
+    avg_tps: 50,
+    cache_request_count: 3,
+    cache_read_tokens: 360,
+    cache_eligible_tokens: 600,
+  },
+  {
+    model_name: "gpt-5.6-terra",
+    request_count: 4,
+    success_rate: 0.75,
+    avg_ttfb_ms: 200,
+    avg_tps: 30,
+    cache_request_count: 2,
+    cache_read_tokens: 40,
+    cache_eligible_tokens: 400,
+  },
+]);
 const encoded = JSON.stringify(aggregate);
 for (const secret of ["PRIVATE_PROVIDER_NAME", "PRIVATE_UPSTREAM_KEY", "PRIVATE_GROUP", "MOCK_CCH_KEY", "127.0.0.1:18765"]) {
   assert.equal(encoded.includes(secret), false, `aggregate leaked ${secret}`);

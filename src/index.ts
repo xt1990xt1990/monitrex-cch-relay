@@ -29,10 +29,10 @@ interface RemoteProvider {
 }
 
 const SERVICE = "monitrex-cch-relay";
-const VERSION = "0.1.0";
-const PROTOCOL_VERSION = 1;
-const PRIVACY_VERSION = 1;
-const SCHEMA_VERSION = 1;
+const VERSION = "0.2.0";
+const PROTOCOL_VERSION = 2;
+const PRIVACY_VERSION = 2;
+const SCHEMA_VERSION = 2;
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 
 const SCHEMA_SQL = `
@@ -277,13 +277,10 @@ function optionalNonnegative(value: unknown): number | null {
   return parsed !== null && parsed >= 0 ? parsed : null;
 }
 
-function metrics(
-  providerId: number,
-  providerRows: Map<number, Record<string, unknown>>,
-  cacheRows: Map<number, Record<string, unknown>>,
+function metricValues(
+  provider: Record<string, unknown> | undefined,
+  cache: Record<string, unknown> | undefined,
 ) {
-  const provider = providerRows.get(providerId);
-  const cache = cacheRows.get(providerId);
   const successRate = number(provider?.successRate);
   const eligible = count(cache?.totalInputTokens);
   return {
@@ -295,6 +292,50 @@ function metrics(
     cache_read_tokens: Math.min(count(cache?.cacheReadTokens), eligible),
     cache_eligible_tokens: eligible,
   };
+}
+
+function metrics(
+  providerId: number,
+  providerRows: Map<number, Record<string, unknown>>,
+  cacheRows: Map<number, Record<string, unknown>>,
+) {
+  return metricValues(providerRows.get(providerId), cacheRows.get(providerId));
+}
+
+function modelName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const name = value.trim();
+  return name && name.length <= 200 && !/[\u0000-\u001f\u007f]/.test(name) ? name : null;
+}
+
+function modelRows(parent: Record<string, unknown> | undefined): Map<string, Record<string, unknown>> {
+  const result = new Map<string, Record<string, unknown>>();
+  if (!parent || !Array.isArray(parent.modelStats)) return result;
+  for (const row of parent.modelStats.filter(isRecord)) {
+    const name = modelName(row.model);
+    if (name) result.set(name.toLowerCase(), row);
+  }
+  return result;
+}
+
+function modelMetrics(
+  providerId: number,
+  providerRows: Map<number, Record<string, unknown>>,
+  cacheRows: Map<number, Record<string, unknown>>,
+) {
+  const providerModels = modelRows(providerRows.get(providerId));
+  const cacheModels = modelRows(cacheRows.get(providerId));
+  const keys = new Set([...providerModels.keys(), ...cacheModels.keys()]);
+  return [...keys]
+    .map((key) => {
+      const provider = providerModels.get(key);
+      const cache = cacheModels.get(key);
+      return {
+        model_name: modelName(provider?.model) ?? modelName(cache?.model)!,
+        ...metricValues(provider, cache),
+      };
+    })
+    .sort((left, right) => left.model_name.localeCompare(right.model_name));
 }
 
 async function collect(secrets: SecretConfig, instanceId: string) {
@@ -311,7 +352,7 @@ async function collect(secrets: SecretConfig, instanceId: string) {
   const [providerEnvelope, availabilityValue, providerValue, cacheValue] = await Promise.all([
     cchGet(secrets.cch_url, secrets.cch_api_key, "/api/v1/providers"),
     cchGet(secrets.cch_url, secrets.cch_api_key, `/api/availability?${query}`),
-    cchGet(secrets.cch_url, secrets.cch_api_key, "/api/leaderboard?period=daily&scope=provider"),
+    cchGet(secrets.cch_url, secrets.cch_api_key, "/api/leaderboard?period=daily&scope=provider&includeModelStats=true"),
     cchGet(secrets.cch_url, secrets.cch_api_key, "/api/leaderboard?period=daily&scope=providerCacheHitRate"),
   ]);
   const providerItems = isRecord(providerEnvelope) && Array.isArray(providerEnvelope.items)
@@ -338,6 +379,7 @@ async function collect(secrets: SecretConfig, instanceId: string) {
       endpoint_path: endpoint.path,
       availability: availability.get(providerId) || [],
       metrics: metrics(providerId, providerRows, cacheRows),
+      model_metrics: modelMetrics(providerId, providerRows, cacheRows),
     });
   }
   return {
