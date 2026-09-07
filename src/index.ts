@@ -506,17 +506,25 @@ function setupPage(configured: boolean): Response {
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MoniTrex CCH Relay</title><style>
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#09090b;color:#d4d4d8;font:14px/1.55 system-ui,sans-serif}main{max-width:760px;margin:0 auto;padding:32px 20px 64px}h1{font-size:22px;color:#fafafa;margin:0 0 8px}h2{font-size:15px;color:#f4f4f5;margin:28px 0 10px}.status{border-left:3px solid ${configured ? "#00e052" : "#f59e0b"};padding:8px 12px;background:#18181b}label{display:block;margin:12px 0 5px;color:#a1a1aa}input{width:100%;border:1px solid #3f3f46;background:#09090b;color:#fafafa;border-radius:6px;padding:10px 11px;font:inherit}button{border:1px solid #52525b;background:#f4f4f5;color:#18181b;border-radius:6px;padding:9px 14px;font-weight:600;cursor:pointer}.danger{background:transparent;color:#ff5454;border-color:#7f1d1d}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}.note{color:#71717a;font-size:12px}code{font-family:ui-monospace,monospace;color:#a1a1aa}@media(max-width:600px){.grid{grid-template-columns:1fr}}
+.token-field{display:flex;gap:6px}.token-field input{min-width:0;flex:1}.generate-token{flex:none;min-height:44px;padding:0 10px;background:transparent;color:#a1a1aa;font-size:12px;white-space:nowrap}.generate-token:hover{border-color:#a1a1aa;color:#fafafa}.generate-token:focus-visible{outline:2px solid #a1a1aa;outline-offset:2px}
 </style></head><body><main><h1>MoniTrex CCH Relay</h1>
 <p class="status">${configured ? "Relay 已配置。重新配置需要当前 ADMIN_TOKEN。" : "Relay 尚未配置。提交后凭据不会再次显示。"}</p>
 <h2>${configured ? "替换配置" : "首次配置"}</h2>
 <form id="config"><label>CCH URL</label><input name="cch_url" type="url" required placeholder="https://cch.example.com">
 <label>CCH API Key</label><input name="cch_api_key" type="password" required autocomplete="off">
-<div class="grid"><div><label>PULL_TOKEN</label><input name="pull_token" type="password" minlength="16" required autocomplete="new-password"></div>
-<div><label>新的 ADMIN_TOKEN</label><input name="admin_token" type="password" minlength="16" required autocomplete="new-password"></div></div>
+<div class="grid"><div><label for="pull-token">PULL_TOKEN</label><div class="token-field"><input id="pull-token" name="pull_token" type="password" minlength="16" required autocomplete="new-password"><button type="button" class="generate-token" data-token="pull_token" aria-label="生成 PULL_TOKEN" title="生成随机 PULL_TOKEN">生成</button></div></div>
+<div><label for="admin-token">新的 ADMIN_TOKEN</label><div class="token-field"><input id="admin-token" name="admin_token" type="password" minlength="16" required autocomplete="new-password"><button type="button" class="generate-token" data-token="admin_token" aria-label="生成新的 ADMIN_TOKEN" title="生成随机 ADMIN_TOKEN">生成</button></div></div></div>
 ${configured ? '<label>当前 ADMIN_TOKEN</label><input name="current_admin_token" type="password" minlength="16" required autocomplete="current-password">' : ""}
 <p class="note">PULL_TOKEN 用于 MoniTrex 拉取；ADMIN_TOKEN 只用于管理。请使用两个不同的随机值。</p><button>验证 CCH 并保存</button></form>
 ${configured ? '<h2>清除 Relay</h2><form id="clear"><label>ADMIN_TOKEN</label><input name="admin_token" type="password" minlength="16" required autocomplete="current-password"><p class="note">清除后 D1 中的加密 CCH 配置、令牌摘要和状态都会删除。</p><button class="danger">清除 Relay 配置</button></form>' : ""}
 <p id="result" class="status" hidden></p><script>
+document.querySelectorAll('[data-token]').forEach(button=>button.addEventListener('click',()=>{
+  const input=document.querySelector('#config').elements.namedItem(button.dataset.token);
+  input.value=Array.from(crypto.getRandomValues(new Uint8Array(32)),byte=>byte.toString(16).padStart(2,'0')).join('');
+  input.type='text';
+  input.focus();
+  input.select();
+}));
 async function send(form,path){const out=document.querySelector('#result');out.hidden=false;out.textContent='处理中...';try{const body=Object.fromEntries(new FormData(form).entries());const response=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok)throw new Error(data.error||('HTTP '+response.status));out.textContent=data.ok?'操作完成，请刷新页面。':JSON.stringify(data)}catch(error){out.textContent='操作失败：'+error.message}}
 document.querySelector('#config').addEventListener('submit',event=>{event.preventDefault();send(event.target,'/v1/admin/config')});
 document.querySelector('#clear')?.addEventListener('submit',event=>{event.preventDefault();if(confirm('确定清除 Relay 配置？'))send(event.target,'/v1/admin/clear')});
