@@ -19,6 +19,7 @@ interface RelayConfig {
 interface SecretConfig {
   cch_url: string;
   cch_api_key: string;
+  source_type?: "cch" | "cchp";
 }
 
 interface RemoteProvider {
@@ -29,7 +30,7 @@ interface RemoteProvider {
 }
 
 const SERVICE = "monitrex-cch-relay";
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const PROTOCOL_VERSION = 2;
 const PRIVACY_VERSION = 2;
 const SCHEMA_VERSION = 2;
@@ -222,12 +223,17 @@ function count(value: unknown): number {
   return Math.max(0, Math.floor(number(value) ?? 0));
 }
 
-async function cchGet(baseUrl: string, apiKey: string, path: string): Promise<unknown> {
+async function cchGet(baseUrl: string, apiKey: string, path: string, source = "CCH"): Promise<unknown> {
   const response = await fetch(`${baseUrl}${path}`, {
     headers: { accept: "application/json", authorization: `Bearer ${apiKey}` },
     signal: AbortSignal.timeout(25_000),
   });
-  if (!response.ok) throw new Error(`CCH returned HTTP ${response.status}`);
+  if (!response.ok) {
+    const permissions = source === "CCHP" && response.status === 403
+      ? "; management token requires provider:read, usage:read and usage:inspect"
+      : "";
+    throw new Error(`${source} returned HTTP ${response.status}${permissions}`);
+  }
   const raw = await response.text();
   if (raw.length > MAX_RESPONSE_BYTES) throw new Error("CCH response exceeded 5 MiB");
   return JSON.parse(raw) as unknown;
@@ -339,6 +345,7 @@ function modelMetrics(
 }
 
 async function collect(secrets: SecretConfig, instanceId: string) {
+  if (secrets.source_type === "cchp") return collectCchp(secrets, instanceId);
   const collectedAt = new Date();
   const start = new Date(collectedAt.valueOf() - 24 * 60 * 60 * 1000).toISOString();
   const end = collectedAt.toISOString();
@@ -392,6 +399,124 @@ async function collect(secrets: SecretConfig, instanceId: string) {
   };
 }
 
+function cchpRows(value: unknown, key: string): Record<string, unknown>[] {
+  if (!isRecord(value) || !Array.isArray(value[key])) {
+    throw new Error(`Invalid CCHP ${key} response`);
+  }
+  return value[key].filter(isRecord);
+}
+
+async function cchpProviderId(id: string): Promise<number> {
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(id)));
+  const hex = [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  // Keep UUID identities stable and outside legacy CCH's small numeric ID range.
+  return 2 ** 52 + Number.parseInt(hex.slice(0, 13), 16);
+}
+
+function cchpMetricValues(row: Record<string, unknown> | undefined, leaderboard = false) {
+  const succeeded = count(row?.succeeded);
+  const failed = count(row?.failed);
+  const requestCount = count(row?.requests);
+  const tps = optionalNonnegative(row?.avgTpsMilli);
+  const ttft = optionalNonnegative(row?.avgTtftMs);
+  // CCHP inputTokens already includes cache reads/writes; do not add them again.
+  return metricValues({
+    totalRequests: requestCount,
+    successRate: leaderboard ? row?.successRate : succeeded + failed > 0 ? succeeded / (succeeded + failed) : null,
+    // The leaderboard reports 0 when it has no TTFT samples.
+    avgTtftMs: leaderboard && ttft === 0 ? null : ttft,
+    avgTokensPerSecond: tps === null ? null : tps / 1000,
+  }, {
+    totalRequests: requestCount,
+    totalInputTokens: row?.inputTokens,
+    cacheReadTokens: leaderboard ? row?.cachedTokens : row?.cacheReadTokens,
+  });
+}
+
+async function collectCchp(secrets: SecretConfig, instanceId: string) {
+  const collectedAt = new Date();
+  const get = (path: string) => cchGet(secrets.cch_url, secrets.cch_api_key, path, "CCHP");
+  const me = await get("/api/account/me");
+  if (!isRecord(me) || me.tokenKind !== "management-api" || typeof me.activeOrganizationId !== "string") {
+    throw new Error("CCHP requires an organization-bound management API token");
+  }
+  const orgPath = `/api/account/orgs/${encodeURIComponent(me.activeOrganizationId)}/providers`;
+  const end = collectedAt.toISOString();
+  const midnight = new Date(collectedAt);
+  midnight.setUTCHours(0, 0, 0, 0);
+  const daily = new URLSearchParams({ start: midnight.toISOString(), end });
+  // 24 hourly buckets, including the current partial hour.
+  const hourly = new URLSearchParams({
+    start: new Date(Math.floor(collectedAt.valueOf() / 3_600_000) * 3_600_000 - 23 * 3_600_000).toISOString(),
+    end, granularity: "hour", groupBy: "provider", timezone: "UTC",
+  });
+  const [catalog, totals, leaderboard, series] = await Promise.all([
+    get(orgPath),
+    get(`/api/account/usage/by-provider?${daily}&limit=200`),
+    get(`/api/account/usage/leaderboard?${daily}&dimension=provider`),
+    get(`/api/account/usage/timeseries?${hourly}`),
+  ]);
+  const catalogRows = cchpRows(catalog, "providers");
+  const totalRows = new Map(cchpRows(totals, "items").map((row) => [row.providerId, row]));
+  const modelRows = cchpRows(leaderboard, "entries");
+  if (isRecord(leaderboard) && count(leaderboard.total) > modelRows.length) {
+    throw new Error("CCHP provider leaderboard is truncated; cannot collect complete model metrics");
+  }
+  const models = new Map(modelRows.map((row) => [row.id, row]));
+  const buckets = cchpRows(series, "buckets");
+  if (catalogRows.length > 200) throw new Error("CCHP collection supports at most 200 providers");
+  const providers = [];
+  const seen = new Set<number>();
+  // Sequential endpoint reads stay within the Worker's simultaneous connection limit.
+  for (const row of catalogRows) {
+    if (typeof row.id !== "string" || !row.id) throw new Error("Invalid CCHP provider ID");
+    const endpoints = cchpRows(await get(`${orgPath}/${encodeURIComponent(row.id)}/endpoints`), "endpoints");
+    const candidates = endpoints.map((endpoint) => ({
+      active: endpoint.status === "active",
+      identity: endpointIdentity(String(endpoint.base_url ?? "")),
+    })).filter((endpoint) => endpoint.identity !== null);
+    // A CCHP supplier's aggregate is emitted once, using one endpoint to match its identity.
+    const endpoint = (candidates.find((candidate) => candidate.active) ?? candidates[0])?.identity;
+    if (!endpoint) continue;
+    const id = await cchpProviderId(row.id);
+    if (seen.has(id)) throw new Error("Duplicate CCHP provider identity");
+    seen.add(id);
+    const availability = buckets.filter((bucket) => bucket.groupId === row.id).map((bucket) => {
+      const start = new Date(String(bucket.bucket ?? ""));
+      return {
+        bucketStart: start.toISOString(),
+        bucketEnd: new Date(Math.min(start.valueOf() + 3_600_000, collectedAt.valueOf())).toISOString(),
+        totalRequests: bucket.requests,
+        greenCount: bucket.succeeded,
+        redCount: bucket.failed,
+      };
+    });
+    const modelParent = models.get(row.id);
+    const children = Array.isArray(modelParent?.children) ? modelParent.children.filter(isRecord) : [];
+    providers.push({
+      cch_provider_id: id,
+      provider_type: "cchp",
+      website_host: null,
+      endpoint_host: endpoint.host,
+      endpoint_path: endpoint.path,
+      availability: availabilityMap({ providers: [{ providerId: id, timeBuckets: availability }] }, collectedAt).get(id) ?? [],
+      metrics: cchpMetricValues(totalRows.get(row.id)),
+      model_metrics: children.flatMap((child) => {
+        const name = modelName(child.model);
+        return name ? [{ model_name: name, ...cchpMetricValues(child, true) }] : [];
+      }).sort((left, right) => left.model_name.localeCompare(right.model_name)),
+    });
+  }
+  return {
+    schema_version: SCHEMA_VERSION,
+    protocol_version: PROTOCOL_VERSION,
+    privacy_version: PRIVACY_VERSION,
+    source_ref: instanceId,
+    collected_at: end,
+    providers,
+  };
+}
+
 function safeError(error: unknown): string {
   const message = error instanceof Error ? error.message : "unknown error";
   return message.replace(/[\r\n\t]/g, " ").slice(0, 300);
@@ -416,7 +541,7 @@ async function aggregate(request: Request, env: Env): Promise<Response> {
     await env.DB.prepare(
       "UPDATE relay_config SET last_error = ?, updated_at = ? WHERE singleton = 1",
     ).bind(safeError(error), new Date().toISOString()).run();
-    return json({ error: "CCH collection failed" }, 502);
+    return json({ error: "CCH / CCHP collection failed" }, 502);
   }
 }
 
@@ -442,13 +567,17 @@ async function saveConfig(request: Request, env: Env): Promise<Response> {
   }
   const cchUrl = normalizeCchUrl(body.cch_url || "");
   const cchApiKey = (body.cch_api_key || "").trim();
+  const sourceType = body.source_type || "cch";
+  if (sourceType !== "cch" && sourceType !== "cchp") return json({ error: "Select CCH or CCHP" }, 400);
   const pullToken = body.pull_token || "";
   const adminToken = body.admin_token || "";
   if (cchApiKey.length < 8 || pullToken.length < 16 || adminToken.length < 16 || pullToken === adminToken) {
     return json({ error: "CCH key and two different tokens are required; tokens need at least 16 characters" }, 400);
   }
-  await cchGet(cchUrl, cchApiKey, "/api/v1/providers");
-  const encrypted = await encryptSecrets({ cch_url: cchUrl, cch_api_key: cchApiKey }, pullToken);
+  const secrets: SecretConfig = { cch_url: cchUrl, cch_api_key: cchApiKey, source_type: sourceType };
+  if (sourceType === "cchp") await collectCchp(secrets, existing?.instance_id || "config-check");
+  else await cchGet(cchUrl, cchApiKey, "/api/v1/providers");
+  const encrypted = await encryptSecrets(secrets, pullToken);
   const pullSalt = randomBytes(16);
   const adminSalt = randomBytes(16);
   const now = new Date().toISOString();
@@ -505,17 +634,19 @@ function setupPage(configured: boolean): Response {
   return html(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MoniTrex CCH Relay</title><style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#09090b;color:#d4d4d8;font:14px/1.55 system-ui,sans-serif}main{max-width:760px;margin:0 auto;padding:32px 20px 64px}h1{font-size:22px;color:#fafafa;margin:0 0 8px}h2{font-size:15px;color:#f4f4f5;margin:28px 0 10px}.status{border-left:3px solid ${configured ? "#00e052" : "#f59e0b"};padding:8px 12px;background:#18181b}label{display:block;margin:12px 0 5px;color:#a1a1aa}input{width:100%;border:1px solid #3f3f46;background:#09090b;color:#fafafa;border-radius:6px;padding:10px 11px;font:inherit}button{border:1px solid #52525b;background:#f4f4f5;color:#18181b;border-radius:6px;padding:9px 14px;font-weight:600;cursor:pointer}.danger{background:transparent;color:#ff5454;border-color:#7f1d1d}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}.note{color:#71717a;font-size:12px}code{font-family:ui-monospace,monospace;color:#a1a1aa}@media(max-width:600px){.grid{grid-template-columns:1fr}}
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#09090b;color:#d4d4d8;font:14px/1.55 system-ui,sans-serif}main{max-width:760px;margin:0 auto;padding:32px 20px 64px}h1{font-size:22px;color:#fafafa;margin:0 0 8px}h2{font-size:15px;color:#f4f4f5;margin:28px 0 10px}.status{border-left:3px solid ${configured ? "#00e052" : "#f59e0b"};padding:8px 12px;background:#18181b}label{display:block;margin:12px 0 5px;color:#a1a1aa}input,select{width:100%;border:1px solid #3f3f46;background:#09090b;color:#fafafa;border-radius:6px;padding:10px 11px;font:inherit}button{border:1px solid #52525b;background:#f4f4f5;color:#18181b;border-radius:6px;padding:9px 14px;font-weight:600;cursor:pointer}.danger{background:transparent;color:#ff5454;border-color:#7f1d1d}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}.note{color:#71717a;font-size:12px}code{font-family:ui-monospace,monospace;color:#a1a1aa}@media(max-width:600px){.grid{grid-template-columns:1fr}}
 .token-field{display:flex;gap:6px}.token-field input{min-width:0;flex:1}.generate-token{flex:none;min-height:44px;padding:0 10px;background:transparent;color:#a1a1aa;font-size:12px;white-space:nowrap}.generate-token:hover{border-color:#a1a1aa;color:#fafafa}.generate-token:focus-visible{outline:2px solid #a1a1aa;outline-offset:2px}
 </style></head><body><main><h1>MoniTrex CCH Relay</h1>
 <p class="status">${configured ? "Relay 已配置。重新配置需要当前 ADMIN_TOKEN。" : "Relay 尚未配置。提交后凭据不会再次显示。"}</p>
 <h2>${configured ? "替换配置" : "首次配置"}</h2>
-<form id="config"><label>CCH URL</label><input name="cch_url" type="url" required placeholder="https://cch.example.com">
-<label>CCH API Key</label><input name="cch_api_key" type="password" required autocomplete="off">
+<form id="config"><label for="source-type">数据源类型</label><select id="source-type" name="source_type"><option value="cch">CCH</option><option value="cchp">CCHP</option></select>
+<label>CCH / CCHP 控制台 URL</label><input name="cch_url" type="url" required placeholder="https://cch.example.com">
+<label>CCH API Key / CCHP 管理 Token</label><input name="cch_api_key" type="password" required autocomplete="off">
+<p class="note">CCHP 使用组织内创建的管理 API Token，需要 provider:read、usage:read 和 usage:inspect 权限。填写控制台地址；组织自动从 Token 读取。</p>
 <div class="grid"><div><label for="pull-token">PULL_TOKEN</label><div class="token-field"><input id="pull-token" name="pull_token" type="password" minlength="16" required autocomplete="new-password"><button type="button" class="generate-token" data-token="pull_token" aria-label="生成 PULL_TOKEN" title="生成随机 PULL_TOKEN">生成</button></div></div>
 <div><label for="admin-token">新的 ADMIN_TOKEN</label><div class="token-field"><input id="admin-token" name="admin_token" type="password" minlength="16" required autocomplete="new-password"><button type="button" class="generate-token" data-token="admin_token" aria-label="生成新的 ADMIN_TOKEN" title="生成随机 ADMIN_TOKEN">生成</button></div></div></div>
 ${configured ? '<label>当前 ADMIN_TOKEN</label><input name="current_admin_token" type="password" minlength="16" required autocomplete="current-password">' : ""}
-<p class="note">PULL_TOKEN 用于 MoniTrex 拉取；ADMIN_TOKEN 只用于管理。请使用两个不同的随机值。</p><button>验证 CCH 并保存</button></form>
+<p class="note">PULL_TOKEN 用于 MoniTrex 拉取；ADMIN_TOKEN 只用于管理。请使用两个不同的随机值。</p><button>验证数据源并保存</button></form>
 ${configured ? '<h2>清除 Relay</h2><form id="clear"><label>ADMIN_TOKEN</label><input name="admin_token" type="password" minlength="16" required autocomplete="current-password"><p class="note">清除后 D1 中的加密 CCH 配置、令牌摘要和状态都会删除。</p><button class="danger">清除 Relay 配置</button></form>' : ""}
 <p id="result" class="status" hidden></p><script>
 document.querySelectorAll('[data-token]').forEach(button=>button.addEventListener('click',()=>{
